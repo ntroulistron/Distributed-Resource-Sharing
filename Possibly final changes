@@ -1,0 +1,290 @@
+globals [
+  tasks-completed             ;; total completed tasks
+  deadlocks-detected          ;; counts deadlocks
+  last-tasks-completed        ;; tasks completed from last check
+  total-required-resources    ;; resources each task needs
+  deadlock-check-interval     ;; how often we check for deadlocks
+  max-wait-time               ;; max wait before retry
+  backoff-range               ;; random wait time range for retry
+  completion-rate             ;; shows the rate of tasks completed by "%"
+]
+
+breed [processes process]     ;; represents processes
+breed [resources resource]    ;; represents resources needed by processes
+
+processes-own [
+  resources-held              ;; resources currently held
+  task-completed?             ;; if task is finished
+  waiting-time                ;; time waiting for resources
+  task-start-time             ;; when task started
+  task-duration               ;; time needed to finish
+]
+
+resources-own [
+  held-by                     ;; which process holds the resource
+  resource-id                 ;; ID for the resource
+]
+
+to setup
+  clear-all
+  print "Setting up resources and processes."
+
+  ;; Initialize global settings
+  set total-required-resources 2
+  set deadlock-check-interval 50
+  set max-wait-time 100
+  set backoff-range 20
+  set tasks-completed 0
+  set deadlocks-detected 0
+  set last-tasks-completed 0
+
+  ;; Create resources
+  create-resources num-resources [
+    set shape "circle"
+    set size 2
+    set color yellow
+    set held-by nobody
+    set resource-id who
+    setxy random-xcor random-ycor
+    print (word "Resource " resource-id " created.")
+  ]
+
+  ;; Create processes
+  create-processes num-processes [
+    set shape "person"
+    set size 2
+    set color blue
+    set task-completed? false
+    set resources-held []
+    set waiting-time 0
+    set task-start-time 0
+    set task-duration 0
+    setxy random-xcor random-ycor
+    print (word "Process " who " created.")
+  ]
+
+  ;; Ensure valid backoff range
+  if backoff-range <= 0 [
+    user-message "Backoff range must be positive!"
+    stop
+  ]
+
+  reset-ticks
+  print "Setup complete."
+end
+
+to go
+  if ticks >= max-tick [ stop ]  ;; Stop when max ticks reached
+  
+  set completion-rate (tasks-completed / num-processes) * 100
+  
+  ;; Processes try to complete tasks
+  ask processes [
+    if not task-completed? [
+      attempt-task
+    ]
+    set heading random 360
+    forward 1
+    set label (word "Held: " length resources-held " wait: " waiting-time)
+  ]
+
+  ;; Update resource labels
+  ask resources [
+    ifelse held-by = nobody [
+      set label ""
+    ] [
+      set label word "Held by " [who] of held-by
+    ]
+  ]
+
+  detect-deadlocks  ;; Check for deadlocks
+
+  ;; Update plot
+  set-current-plot "Tasks-Completed"
+  set-current-plot-pen "Tasks-Completed-Pen"
+  plot tasks-completed
+
+  set-current-plot "Deadlocks-Detected"
+  set-current-plot-pen "Deadlocks-Detected-Pen"
+  plot deadlocks-detected
+
+  tick
+  wait 0.15
+end
+
+to attempt-task
+  ;; Start tracking task if not started
+  if task-start-time = 0 [
+    set task-start-time ticks
+  ]
+
+  ;; If task duration is set, count down until done
+  ifelse task-duration > 0 [
+    set task-duration task-duration - 1
+    if task-duration = 0 [
+      perform-task
+    ]
+  ] [
+    ;; Request resources if not holding enough
+    request-all-resources
+
+    ifelse length resources-held = total-required-resources [
+      set task-duration 5  ;; Set task duration when resources obtained
+    ] [
+      ;; Increment wait time if not enough resources
+      set waiting-time waiting-time + 1
+      if waiting-time > max-wait-time [
+        print (word "Process " who " timed out, releasing resources.")
+        release-resources
+        set waiting-time 0
+        set task-start-time 0
+      ]
+    ]
+  ]
+end
+
+to request-all-resources
+  ;; Check if enough resources are available
+  if count resources < total-required-resources [
+    user-message "Not enough resources available!"
+    stop
+  ]
+
+  let available-resources resources with [held-by = nobody]
+
+  if count available-resources < total-required-resources [
+    stop
+  ]
+
+  ;; Get needed resources in order
+  let sorted-available-resources sort available-resources
+  let needed-resources sublist sorted-available-resources 0 total-required-resources
+
+  ifelse two-phase-locking [
+    ;; Lock all resources at once
+    foreach needed-resources [
+      res -> ask res [
+        set held-by myself
+        set color red
+      ]
+      set resources-held lput res resources-held
+      print (word "Process " who " got resource " [resource-id] of res)
+    ]
+  ] [
+    ;; Lock one resource at a time with wait
+    foreach needed-resources [
+      res -> ifelse [held-by] of res = nobody [
+        ask res [
+          set held-by myself
+          set color red
+        ]
+        set resources-held lput res resources-held
+        print (word "Process " who " got resource " [resource-id] of res)
+      ] [
+        set waiting-time waiting-time + random backoff-range
+      ]
+    ]
+  ]
+end
+
+to perform-task
+  set task-completed? true
+  set tasks-completed tasks-completed + 1
+  set color green
+  print (word "Process " who " completed its task at tick " ticks)
+  release-resources
+  reset-task
+end
+
+to reset-task
+  set task-completed? false
+  set task-duration 0
+  set waiting-time 0
+  set resources-held []
+  set task-start-time ticks
+  set color blue
+  print (word "Process " who " starting new task.")
+end
+
+to release-resources
+  let released-ids []
+  foreach resources-held [
+    res -> ask res [
+      set held-by nobody
+      set color yellow
+    ]
+    set released-ids lput [resource-id] of res released-ids
+  ]
+  set resources-held []
+  print (word "Process " who " released resources: " released-ids)
+end
+
+to detect-deadlocks
+  ;; Check if no tasks were completed recently
+  if tasks-completed = last-tasks-completed [
+    let deadlock-occurred? false
+    ask processes [
+      if not task-completed? and length resources-held < total-required-resources [
+        if waiting-time > max-wait-time [
+          let needed-resources total-required-resources - length resources-held
+          let available-resources count (resources with [held-by = nobody])
+          if available-resources < needed-resources [
+            set deadlock-occurred? true
+          ]
+        ]
+      ]
+    ]
+
+    ;; Handle deadlocks by releasing resources
+    if deadlock-occurred? [
+      print "Deadlock detected!"
+      set deadlocks-detected deadlocks-detected + 1
+
+      ifelse two-phase-locking [
+        ask processes [
+          if not task-completed? [
+            release-resources
+            set waiting-time 0
+            set task-start-time ticks + 1 + random backoff-range
+          ]
+        ]
+      ] [
+        ask processes [
+          if not task-completed? and not empty? resources-held [
+            let res-to-release one-of resources-held
+            ask res-to-release [
+              set held-by nobody
+              set color yellow
+            ]
+            set resources-held remove res-to-release resources-held
+            print (word "Process " who " released a resource to resolve deadlock.")
+          ]
+        ]
+      ]
+    ]
+  ]
+
+  ;; Update last-tasks-completed if progress made
+  if tasks-completed > last-tasks-completed [
+    set last-tasks-completed tasks-completed
+  ]
+end
+
+to-report all-tasks-completed?
+  report all? processes [ task-completed? ]
+end
+
+to-report total-wait-time
+  report sum [waiting-time] of processes
+end
+
+to-report average-wait-time
+  let total-wait sum [waiting-time] of processes
+  report total-wait / num-processes
+end
+
+
+to-report combined-metrics
+  report (list tasks-completed deadlocks-detected average-wait-time)
+end
+
